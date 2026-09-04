@@ -36,13 +36,13 @@ The library exposes a global `WeeglooServiceLogin`.
 ```
 
 Look up the hash for your version in the CDN manifest at
-`https://weegloo-media.com/static/libs/service-login/manifest.json`. For v1.1.0:
+`https://weegloo-media.com/static/libs/service-login/manifest.json`. For v1.2.0:
 
 | Build | Pinned filename |
 |---|---|
-| UMD | `service-login.4ba25e91.js` |
-| ESM | `service-login.51817f08.esm.js` |
-| UMD, minified | `service-login.7f47bcb0.min.js` |
+| UMD | `service-login.1d61de31.js` |
+| ESM | `service-login.f4274749.esm.js` |
+| UMD, minified | `service-login.a15b8894.min.js` |
 
 Available filenames — `service-login.js` (UMD), `service-login.esm.js` (ESM), `service-login.min.js` (UMD minified), each with a `.<hash>` variant.
 
