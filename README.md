@@ -175,8 +175,8 @@ Calling `init()` multiple times with the same `spaceId | authBaseUrl` pair retur
 
 | Method | Returns | Description |
 |---|---|---|
-| `login(opts?)` | `void` | Redirects the browser to the OAuth login page. |
-| `handleCallback(opts?)` | `Promise<tokens>` | Call on the callback page. **First** strips `exchangeToken` from the address bar, **then** exchanges it for tokens and stores them. |
+| `login(opts?)` | `Promise<void>` | Redirects the browser to the OAuth login page. Options: `provider`, `returnTo`, and `redirectUri` (see *Returning to more than one URL*). |
+| `handleCallback(opts?)` | `Promise<tokens>` | Call on the callback page. **First** strips `exchangeToken` from the address bar, **then** exchanges it for tokens and stores them. After a `redirectUri` login it also checks `state` and sends the PKCE `codeVerifier`. |
 | `isLoggedIn()` | `boolean` | `true` if `accessToken` is unexpired *or* a valid `refreshToken` exists. |
 | `getAccessToken()` | `Promise<string \| null>` | Returns the access token, auto-refreshing if necessary. `null` if not logged in or refresh failed. |
 | `getTokens()` | `tokens \| null` | Returns the stored token bundle. |
@@ -239,7 +239,58 @@ Other providers follow the same shape with their own console and their own quirk
 3. Set `defaultRole` to a `Refer` of a `ServiceUserRole` you created in advance with the appropriate permissions. Per-member overrides are possible later via `ServiceUser.roleOverride`.
 4. Set `callbackUrl` to a URL on **your own product** that the SDK can intercept — Weegloo redirects the browser there with `?exchangeToken=…` after a successful sign-in, and `handleCallback()` consumes it.
 
-`callbackUrl` must be `http` or `https`; a custom deep-link scheme is not accepted. Native apps bridge through a hosted page that forwards into the app's deep link.
+`callbackUrl` must be `http` or `https`. It is the one URL used when `login()` is called without `redirectUri`. Any other URL you want to return to — `http://localhost:…` while developing, a staging host — goes in `allowedCallbackUrls`; see the next section.
+
+---
+
+## Returning to more than one URL (local development, staging)
+
+`callbackUrl` is a single URL. To sign in from `http://localhost:8080` while the product is deployed elsewhere — without editing `callbackUrl` back and forth — register every return URL in the ServiceLogin's `allowedCallbackUrls` (up to 10) and pass the one you are on as `redirectUri`:
+
+```json
+{
+  "callbackUrl": "https://your-product.example.com/callback",
+  "allowedCallbackUrls": [
+    { "url": "https://your-product.example.com/callback" },
+    { "url": "http://localhost:8080/callback" }
+  ]
+}
+```
+
+```js
+// Same code on every environment — each one returns to itself.
+document.querySelector('#login').onclick = () =>
+  auth.login({ redirectUri: location.origin + '/callback' });
+
+(async () => {
+  // A redirectUri login can also come back with ?error=… instead of ?exchangeToken=…
+  const q = new URLSearchParams(location.search);
+  if (q.has('exchangeToken') || q.has('error')) {
+    try {
+      await auth.handleCallback();
+    } catch (e) {
+      // e.g. "Your account is waiting for approval — contact admin@example.com"
+      if (e.code === 'LOGIN_FAILED') console.warn(e.error, e.contact);
+      else console.error(e);
+    }
+  }
+})();
+```
+
+With `redirectUri` the SDK runs PKCE (S256) and `state` for you: `login()` stores a one-time verifier under `<storageKey>:pkce`, and `handleCallback()` checks the returned `state` and sends the verifier with the exchange. Without `redirectUri`, nothing changes — Weegloo returns to `callbackUrl` exactly as before.
+
+- **Only registered URLs — `callbackUrl` does not count.** When `redirectUri` is given, Weegloo checks it against `allowedCallbackUrls` **alone**. A `redirectUri` equal to `callbackUrl` is still refused unless that URL is also in `allowedCallbackUrls`, and with an **empty** `allowedCallbackUrls` every `redirectUri` is refused. Pass `redirectUri` only for a URL you have registered; to return to `callbackUrl`, call `login()` without it.
+- **Match exactly.** `redirectUri` must equal a registered `url` character for character — `http://localhost:8080/callback/` (trailing slash), `http://127.0.0.1:8080/callback`, or another port are all different URLs. An unregistered value fails at the login entry with `WGL400075` (some deployments answer an unregistered value with a bare HTTP `500` instead).
+- **An unregistered `redirectUri` cannot be caught in code.** `login()` resolves as soon as it has issued the navigation, so the refusal happens on the Weegloo login-entry page, after the browser has left your app — no `.catch()` or `handleCallback()` sees it, and Weegloo cannot send the browser back to a URL it has not registered. The browser simply stops on an error page. The browser also cannot read `allowedCallbackUrls`, so decide in your own config which environments pass `redirectUri`, and keep that list in step with the ServiceLogin.
+- **Secure context only.** PKCE needs `crypto.subtle`, which browsers expose on `https` and on `http://localhost` / `http://127.0.0.1` — not on other plain-`http` hosts such as a LAN IP. There, `login()` rejects with `code: 'PKCE_UNSUPPORTED'`.
+- **Same tab.** With the default `sessionStorage`, the callback must land in the tab that called `login()` (the normal redirect flow does).
+
+On failure Weegloo returns to the `redirectUri` instead of its own notice page, and `handleCallback()` rejects:
+
+| `e.code` | When | Extra fields |
+|---|---|---|
+| `LOGIN_FAILED` | Weegloo refused the sign-in | `e.error`: `signup_limit_exceeded` · `approval_required` · `email_conflict` · `email_required` · `server_error`; `e.contact`: the ServiceLogin's contact email |
+| `STATE_MISMATCH` | The callback does not belong to the login this browser started | — |
 
 ---
 
@@ -250,13 +301,15 @@ The SDK encapsulates all of this; read it only if you are debugging or porting t
 1. Navigate the browser to:
    `GET https://auth.weegloo.com/v1/spaces/{spaceId}/login/oauth2/{provider}`
    The user signs in through the provider.
-2. Weegloo redirects the browser to the configured `callbackUrl` with `?exchangeToken=…` appended.
+   To return somewhere other than `callbackUrl`, append `redirect_uri` (one of `allowedCallbackUrls`), `code_challenge` (BASE64URL, no padding, of SHA-256 over the `code_verifier`), `code_challenge_method=S256`, and an optional `state`.
+2. Weegloo redirects the browser to the configured `callbackUrl` with `?exchangeToken=…` appended — or, when `redirect_uri` was sent, to that URL with `?exchangeToken=…&state=…` (on failure `?error=…&contact=…&state=…`).
 3. Exchange the `exchangeToken` for tokens:
    `POST https://auth.weegloo.com/v1/spaces/{spaceId}/oauth/token`
    `Content-Type: application/json`
    ```json
    { "exchangeToken": "abc" }
    ```
+   When the login sent a `code_challenge`, add `"codeVerifier": "<the code_verifier>"`.
    Response:
    ```json
    {
