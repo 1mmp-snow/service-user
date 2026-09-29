@@ -185,22 +185,61 @@
     return joinUrl(authBaseUrl, '/v1/spaces/' + encodeURIComponent(spaceId) + '/oauth/refresh');
   }
 
-  // Best-effort removal of `exchangeToken` from the live address bar via
-  // history.replaceState. Idempotent; safe to call when the param is absent.
-  function stripExchangeTokenFromAddressBar() {
+  // Best-effort removal of the given query params from the live address bar via
+  // history.replaceState. Idempotent; safe to call when the params are absent.
+  function stripParamsFromAddressBar(names) {
     if (typeof window === 'undefined') return;
     if (!window.location || !window.history) return;
     if (typeof window.history.replaceState !== 'function') return;
     var search = window.location.search || '';
-    if (search.indexOf('exchangeToken') < 0) return;
+    if (!search) return;
     try {
       var p = new URLSearchParams(search);
-      if (!p.has('exchangeToken')) return;
-      p['delete']('exchangeToken');
+      var stripped = false;
+      for (var i = 0; i < names.length; i++) {
+        if (p.has(names[i])) {
+          p['delete'](names[i]);
+          stripped = true;
+        }
+      }
+      if (!stripped) return;
       var qs = p.toString();
       var newUrl = window.location.pathname + (qs ? ('?' + qs) : '') + (window.location.hash || '');
       window.history.replaceState(null, '', newUrl);
     } catch (_e) { /* noop */ }
+  }
+
+  // ---------------------------------------------------------------------------
+  // PKCE (RFC 7636, S256) - used only when login() is given a redirectUri
+  // ---------------------------------------------------------------------------
+
+  var PKCE_VERIFIER_BYTES = 32; // 43 base64url chars - the RFC 7636 minimum length
+  var STATE_BYTES = 16;
+
+  // Params Weegloo appends when it returns to a redirectUri (success or failure).
+  var REDIRECT_URI_CALLBACK_PARAMS = ['exchangeToken', 'state', 'error', 'contact'];
+
+  function isPkceSupported() {
+    // crypto.subtle exists only in a secure context (https, or http://localhost).
+    return typeof window !== 'undefined' && !!window.crypto && !!window.crypto.subtle &&
+      typeof window.crypto.getRandomValues === 'function' && typeof TextEncoder === 'function';
+  }
+
+  function base64UrlEncode(bytes) {
+    var binary = '';
+    for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  function randomBase64Url(byteLength) {
+    var bytes = new Uint8Array(byteLength);
+    window.crypto.getRandomValues(bytes);
+    return base64UrlEncode(bytes);
+  }
+
+  function s256(codeVerifier) {
+    return window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier))
+      .then(function (digest) { return base64UrlEncode(new Uint8Array(digest)); });
   }
 
   // ---------------------------------------------------------------------------
@@ -251,6 +290,45 @@
       notify(reason || 'clear', null);
     }
 
+    // The PKCE verifier + state of a redirectUri login, kept until its callback.
+    var pendingKey = storageKey + ':pkce';
+
+    function writePendingAuthorization(pending) {
+      storage.setItem(pendingKey, JSON.stringify(pending));
+    }
+
+    // Read-and-remove: one record answers exactly one callback.
+    function consumePendingAuthorization() {
+      var raw = null;
+      try { raw = storage.getItem(pendingKey); storage.removeItem(pendingKey); } catch (_e) { /* noop */ }
+      if (!raw) return null;
+      try { return JSON.parse(raw); } catch (_e) { return null; }
+    }
+
+    function removePendingAuthorization() {
+      try { storage.removeItem(pendingKey); } catch (_e) { /* noop */ }
+    }
+
+    // Stores a fresh verifier + state and resolves the login-entry query string.
+    function startAuthorization(redirectUri) {
+      if (!isPkceSupported()) {
+        var err = /** @type {any} */ (new Error('WeeglooServiceLogin.login: "redirectUri" needs crypto.subtle, which browsers expose only in a secure context (https, or http://localhost).'));
+        err.code = 'PKCE_UNSUPPORTED';
+        return Promise.reject(err);
+      }
+      var codeVerifier = randomBase64Url(PKCE_VERIFIER_BYTES);
+      var state = randomBase64Url(STATE_BYTES);
+      return s256(codeVerifier).then(function (codeChallenge) {
+        writePendingAuthorization({ state: state, codeVerifier: codeVerifier });
+        return new URLSearchParams({
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: 'S256',
+          state: state
+        }).toString();
+      });
+    }
+
     // ---- public API --------------------------------------------------------
 
     function getTokens() {
@@ -276,17 +354,27 @@
       if (loginOptions && loginOptions.returnTo) {
         try { storage.setItem(storageKey + ':returnTo', String(loginOptions.returnTo)); } catch (_e) { /* noop */ }
       }
-      window.location.assign(url);
+      var redirectUri = loginOptions && loginOptions.redirectUri;
+      if (!redirectUri) {
+        // Weegloo returns to ServiceLogin.callbackUrl. Drop a record left by an
+        // abandoned redirectUri login, or handleCallback() would expect its state.
+        removePendingAuthorization();
+        window.location.assign(url);
+        return Promise.resolve();
+      }
+      return startAuthorization(String(redirectUri)).then(function (query) {
+        window.location.assign(url + '?' + query);
+      });
     }
 
-    function exchangeFor(exchangeToken) {
-      // POST + Content-Type: application/json + JSON body { exchangeToken }.
+    function exchangeFor(exchangeToken, codeVerifier) {
+      // POST + Content-Type: application/json + JSON body { exchangeToken, codeVerifier? }.
       // Browsers cannot send a request body on GET/HEAD (per the Fetch and
       // XHR specs - fetch throws synchronously, XHR silently nulls the body),
       // so the token-exchange endpoint is invoked via POST.
-      return httpJson('POST', buildTokenUrl(authBaseUrl, spaceId), {
-        exchangeToken: exchangeToken
-      });
+      var body = { exchangeToken: exchangeToken };
+      if (codeVerifier) body.codeVerifier = codeVerifier;
+      return httpJson('POST', buildTokenUrl(authBaseUrl, spaceId), body);
     }
 
     function handleCallback(cbOptions) {
@@ -304,20 +392,38 @@
         return Promise.reject(e);
       }
       var exchangeToken = cbOptions.exchangeToken || params.get('exchangeToken');
+      // Present only when this browser started the login with a redirectUri.
+      var pending = consumePendingAuthorization();
 
       // SECURITY: strip exchangeToken from the address bar BEFORE making the
       // network call. The token must NOT linger in window.location / history /
       // outgoing Referer headers regardless of whether the exchange call
       // succeeds, fails, hangs, or the user reloads mid-flight.
       if (cbOptions.cleanUrl !== false) {
-        stripExchangeTokenFromAddressBar();
+        stripParamsFromAddressBar(pending ? REDIRECT_URI_CALLBACK_PARAMS : ['exchangeToken']);
+      }
+
+      if (pending) {
+        if (params.get('state') !== pending.state) {
+          var stateErr = /** @type {any} */ (new Error('WeeglooServiceLogin.handleCallback: "state" does not match the login this browser started.'));
+          stateErr.code = 'STATE_MISMATCH';
+          return Promise.reject(stateErr);
+        }
+        var loginError = params.get('error');
+        if (loginError) {
+          var failure = /** @type {any} */ (new Error('WeeglooServiceLogin.handleCallback: sign-in failed (' + loginError + ').'));
+          failure.code = 'LOGIN_FAILED';
+          failure.error = loginError;
+          failure.contact = params.get('contact');
+          return Promise.reject(failure);
+        }
       }
 
       if (!exchangeToken) {
         return Promise.reject(new Error('WeeglooServiceLogin.handleCallback: "exchangeToken" not found in URL.'));
       }
 
-      return exchangeFor(exchangeToken).then(function (tokens) {
+      return exchangeFor(exchangeToken, pending && pending.codeVerifier).then(function (tokens) {
         setTokens(tokens, 'login');
         return tokens;
       });

@@ -61,6 +61,12 @@ export interface LoginOptions {
   provider?: OAuthProvider;
   /** Arbitrary value stashed in storage; read back with `consumeReturnTo()`. */
   returnTo?: string;
+  /**
+   * Return here instead of `ServiceLogin.callbackUrl`. Must exactly match one of
+   * the ServiceLogin's `allowedCallbackUrls`. Turns on PKCE and `state`, which
+   * need `crypto.subtle` (a secure context: https, or http://localhost).
+   */
+  redirectUri?: string;
 }
 
 export interface HandleCallbackOptions {
@@ -85,9 +91,17 @@ export interface ServiceLoginClient {
   readonly authBaseUrl: string;
   readonly acmaBaseUrl: string;
 
-  /** Navigate the browser to the provider sign-in entry URL. */
-  login(options?: LoginOptions): void;
-  /** Run on the callback page: exchange `?exchangeToken=` for tokens. */
+  /**
+   * Navigate the browser to the provider sign-in entry URL. Resolves once the
+   * navigation is issued; rejects with `code: 'PKCE_UNSUPPORTED'` when
+   * `redirectUri` is given outside a secure context.
+   */
+  login(options?: LoginOptions): Promise<void>;
+  /**
+   * Run on the callback page: exchange `?exchangeToken=` for tokens. After a
+   * `redirectUri` login it also rejects with `code: 'STATE_MISMATCH'`, or with
+   * `code: 'LOGIN_FAILED'` carrying Weegloo's `error` and `contact`.
+   */
   handleCallback(options?: HandleCallbackOptions): Promise<ServiceLoginTokens>;
   /** Force a token refresh. */
   refresh(): Promise<ServiceLoginTokens>;
